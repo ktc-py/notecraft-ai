@@ -30,7 +30,7 @@ const LEGACY_SETTINGS_PROFILE_PATH = `${LEGACY_PRODUCT_FOLDER_PATH}/settings-pro
 const LEGACY_MEMORY_FILE_PATH = `${LEGACY_PRODUCT_FOLDER_PATH}/memory.md`;
 
 type ChatRole = "system" | "user" | "assistant";
-type ProviderId = "deepseek" | "custom";
+type ProviderId = "deepseek" | "ollama" | "custom";
 type ProviderApiMode = "chat_completions" | "responses";
 type ReasoningEffort = "high" | "max";
 type CliToolName = "search" | "read" | "tasks" | "tags" | "unresolved" | "daily" | "files";
@@ -113,12 +113,28 @@ interface Settings {
   uiLanguage: UiLanguage;
   uiFontFamily: string;
   settingsProfilePath: string;
+  autoOrganizeInboxFolder: string;
+  autoOrganizeDefaultFolder: string;
+  autoOrganizeArchiveFolder: string;
+  autoOrganizeBatchLimit: number;
+  periodicAutoOrganizeEnabled: boolean;
+  autoOrganizeIntervalHours: number;
+  lastAutoOrganizeAt: number;
+  autoOrganizeRules: string;
+  markdownFormatRules: string;
 }
 
 interface FileAction {
   action: "create_file" | "replace_file" | "append_file" | "replace_selection" | "update";
   path?: string;
   content: string;
+}
+
+interface OrganizePlan {
+  path: string;
+  content: string;
+  reason?: string;
+  confidence?: "high" | "medium" | "low";
 }
 
 interface QuickPrompt {
@@ -275,6 +291,14 @@ const DEFAULT_SETTINGS: Settings = {
       models: "deepseek-v4-flash\ndeepseek-v4-pro",
       apiMode: "chat_completions"
     },
+    ollama: {
+      apiKey: "",
+      baseUrl: "http://localhost:11434/v1",
+      model: "deepseek-r1:8b",
+      models: "deepseek-r1:8b\ndeepseek-r1:7b\ndeepseek-r1:14b",
+      apiMode: "chat_completions",
+      omitSamplingParams: true
+    },
     custom: {
       apiKey: "",
       baseUrl: "",
@@ -337,7 +361,33 @@ const DEFAULT_SETTINGS: Settings = {
   knowledgeTopK: 8,
   uiLanguage: "zh",
   uiFontFamily: DEFAULT_UI_FONT,
-  settingsProfilePath: DEFAULT_SETTINGS_PROFILE_PATH
+  settingsProfilePath: DEFAULT_SETTINGS_PROFILE_PATH,
+  autoOrganizeInboxFolder: "00_Inbox",
+  autoOrganizeDefaultFolder: "04_Resources",
+  autoOrganizeArchiveFolder: "08_Archive",
+  autoOrganizeBatchLimit: 10,
+  periodicAutoOrganizeEnabled: false,
+  autoOrganizeIntervalHours: 168,
+  lastAutoOrganizeAt: 0,
+  autoOrganizeRules:
+    "請使用以下資料夾規則：\n" +
+    "- 00_Inbox：未整理的快速記錄。\n" +
+    "- 01_Daily：每日記錄、情緒、流水帳。\n" +
+    "- 02_Projects：有明確完成終點、截止日期或交付物的事情。\n" +
+    "- 03_Areas：需要長期維護的工作/生活/健康/財務/關係領域。\n" +
+    "- 04_Resources：知識、工具、學習資料、參考內容。\n" +
+    "- 05_Review：週/月復盤。\n" +
+    "- 06_Memory：人物、事件、決策、承諾、重要生活記憶。\n" +
+    "- 08_Archive：完成、過期或不再需要的內容。\n" +
+    "如果不確定，放到 00_Inbox 並標記 status: needs-review。",
+  markdownFormatRules:
+    "標準化 Markdown：\n" +
+    "- 保留原意和重要細節，不要過度改寫語氣。\n" +
+    "- 補齊 YAML frontmatter，至少包含 type, status, area, project, date, people, tags, summary, next。\n" +
+    "- H1 使用清楚標題；主要段落用 H2。\n" +
+    "- 待辦一律改成 - [ ]。\n" +
+    "- 刪除重複空行，修正標題層級，保留程式碼區塊和引用。\n" +
+    "- 將散亂文字整理成摘要、正文、任務、後續。"
 };
 
 const ACTION_SCHEMA = `Return only JSON with this shape:
@@ -389,6 +439,7 @@ export default class NoteCraftAiPlugin extends Plugin {
     );
 
     this.registerView(VIEW_TYPE, (leaf) => new NoteCraftAiView(leaf, this));
+    this.registerInterval(window.setInterval(() => void this.runPeriodicAutoOrganizeIfDue(), 60 * 1000));
 
     this.addRibbonIcon("sparkles", `Open ${APP_NAME}`, () => {
       void this.activateView();
@@ -435,6 +486,24 @@ export default class NoteCraftAiPlugin extends Plugin {
       id: "open-bug-log",
       name: "NoteCraft AI: open bug log",
       callback: () => void this.openBugLog()
+    });
+
+    this.addCommand({
+      id: "standardize-current-markdown",
+      name: "NoteCraft AI: 一鍵標準化當前 Markdown",
+      callback: () => void this.standardizeCurrentMarkdown()
+    });
+
+    this.addCommand({
+      id: "auto-organize-current-note",
+      name: "NoteCraft AI: AI 自動歸類當前筆記",
+      callback: () => void this.autoOrganizeCurrentNote()
+    });
+
+    this.addCommand({
+      id: "auto-organize-inbox",
+      name: "NoteCraft AI: AI 自動歸類 Inbox",
+      callback: () => void this.autoOrganizeInbox()
     });
 
     this.addCommand({
@@ -606,11 +675,14 @@ export default class NoteCraftAiPlugin extends Plugin {
   }
 
   getProviderConfig(provider: ProviderId = this.settings.provider, customId?: string): ProviderConfig {
-    return provider === "custom" ? this.getCustomProviderConfig(customId) : this.settings.providers.deepseek;
+    if (provider === "custom") return this.getCustomProviderConfig(customId);
+    if (provider === "ollama") return this.settings.providers.ollama;
+    return this.settings.providers.deepseek;
   }
 
   getProviderDisplayName(provider: ProviderId = this.settings.provider, customId?: string): string {
     if (provider === "deepseek") return "DeepSeek";
+    if (provider === "ollama") return "Ollama";
     return this.getCustomProviderConfig(customId).name || "自定義接口";
   }
 
@@ -868,7 +940,8 @@ export default class NoteCraftAiPlugin extends Plugin {
 
   async requestChat(messages: ChatMessage[], jsonOutput: boolean): Promise<string> {
     const config = this.getProviderConfig();
-    if (!config.apiKey.trim()) {
+    const isOllama = this.settings.provider === "ollama";
+    if (!isOllama && !config.apiKey.trim()) {
       throw new Error("缺少 API Key，請先到插件設定中填寫。");
     }
     if (!config.baseUrl.trim()) {
@@ -908,13 +981,17 @@ export default class NoteCraftAiPlugin extends Plugin {
     }
 
     const url = providerRequestUrl(config);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json"
+    };
+    if (!isOllama && config.apiKey.trim()) {
+      headers.Authorization = `Bearer ${config.apiKey.trim()}`;
+    }
+
     const response = await requestUrl({
       url,
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.apiKey.trim()}`
-      },
+      headers,
       body: JSON.stringify(body),
       throw: false
     });
@@ -1001,6 +1078,156 @@ export default class NoteCraftAiPlugin extends Plugin {
       : `Modify the current active Markdown note. Return exactly one replace_file action with path "${file.path}" and the full updated Markdown content.\nUser request: ${prompt}`;
     const actions = await this.planFileActions(request, await this.getActiveContext());
     await this.applyActions(actions);
+  }
+
+  async standardizeCurrentMarkdown() {
+    const view = this.getActiveMarkdownView();
+    const file = view?.file;
+    if (!file) {
+      new Notice("請先打開一份 Markdown。");
+      return;
+    }
+    try {
+      const content = await this.app.vault.read(file);
+      const updated = await this.planStandardizedMarkdown(file.path, content);
+      await this.applyActions([{ action: "replace_file", path: file.path, content: updated }]);
+    } catch (error) {
+      await this.logBug("standardize current markdown failed", error, { path: file.path });
+      new Notice(String(error));
+    }
+  }
+
+  async autoOrganizeCurrentNote() {
+    const view = this.getActiveMarkdownView();
+    const file = view?.file;
+    if (!file) {
+      new Notice("請先打開一份 Markdown。");
+      return;
+    }
+    try {
+      const plan = await this.planOrganizeFile(file);
+      await this.confirmAndApplyOrganizePlans([{ file, plan }]);
+    } catch (error) {
+      await this.logBug("auto organize current note failed", error, { path: file.path });
+      new Notice(String(error));
+    }
+  }
+
+  async autoOrganizeInbox() {
+    const folder = normalizePath(this.settings.autoOrganizeInboxFolder || DEFAULT_SETTINGS.autoOrganizeInboxFolder);
+    const limit = clampNumber(this.settings.autoOrganizeBatchLimit, 1, 50, DEFAULT_SETTINGS.autoOrganizeBatchLimit);
+    const files = this.app.vault.getMarkdownFiles()
+      .filter((file) => file.path.startsWith(`${folder}/`) && !isKnowledgeNoisePath(file.path))
+      .slice(0, limit);
+    if (!files.length) {
+      new Notice(`Inbox 沒有可歸類的 Markdown：${folder}`);
+      return;
+    }
+
+    try {
+      const planned: Array<{ file: TFile; plan: OrganizePlan }> = [];
+      for (const file of files) {
+        planned.push({ file, plan: await this.planOrganizeFile(file) });
+      }
+      await this.confirmAndApplyOrganizePlans(planned);
+    } catch (error) {
+      await this.logBug("auto organize inbox failed", error, { folder, limit });
+      new Notice(String(error));
+    }
+  }
+
+  async runPeriodicAutoOrganizeIfDue() {
+    if (!this.settings.periodicAutoOrganizeEnabled) return;
+    const intervalMs = clampNumber(this.settings.autoOrganizeIntervalHours, 1, 24 * 30, DEFAULT_SETTINGS.autoOrganizeIntervalHours) * 60 * 60 * 1000;
+    if (Date.now() - (this.settings.lastAutoOrganizeAt || 0) < intervalMs) return;
+    this.settings.lastAutoOrganizeAt = Date.now();
+    await this.saveSettings();
+    await this.autoOrganizeInbox();
+  }
+
+  async planStandardizedMarkdown(path: string, content: string): Promise<string> {
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content:
+          `${this.settings.systemPrompt}\n\n` +
+          "You are a Markdown standardization assistant for an Obsidian vault. " +
+          "Return only JSON: {\"content\":\"full standardized markdown\"}. " +
+          "Do not include explanations outside JSON."
+      },
+      {
+        role: "user",
+        content:
+          `File path: ${path}\n\n` +
+          `Rules:\n${this.settings.markdownFormatRules || DEFAULT_SETTINGS.markdownFormatRules}\n\n` +
+          `Markdown:\n${content}`
+      }
+    ];
+    const raw = await this.requestChat(messages, true);
+    const parsed = JSON.parse(stripJsonFence(raw)) as { content?: string };
+    if (!parsed.content?.trim()) throw new Error("AI 沒有返回標準化後的 Markdown。");
+    return parsed.content.trimEnd() + "\n";
+  }
+
+  async planOrganizeFile(file: TFile): Promise<OrganizePlan> {
+    const content = await this.app.vault.read(file);
+    const messages: ChatMessage[] = [
+      {
+        role: "system",
+        content:
+          `${this.settings.systemPrompt}\n\n` +
+          "You are an Obsidian vault librarian. Classify and standardize one Markdown note. " +
+          "Return only JSON with this shape: " +
+          "{\"path\":\"target/folder/title.md\",\"content\":\"full standardized markdown\",\"reason\":\"short reason\",\"confidence\":\"high|medium|low\"}. " +
+          "The path must be vault-relative, must end in .md, and must not be under .obsidian. " +
+          "Do not include explanations outside JSON."
+      },
+      {
+        role: "user",
+        content:
+          `Current path: ${file.path}\n\n` +
+          `Default folder if uncertain: ${this.settings.autoOrganizeDefaultFolder || DEFAULT_SETTINGS.autoOrganizeDefaultFolder}\n` +
+          `Archive folder: ${this.settings.autoOrganizeArchiveFolder || DEFAULT_SETTINGS.autoOrganizeArchiveFolder}\n\n` +
+          `Classification rules:\n${this.settings.autoOrganizeRules || DEFAULT_SETTINGS.autoOrganizeRules}\n\n` +
+          `Markdown format rules:\n${this.settings.markdownFormatRules || DEFAULT_SETTINGS.markdownFormatRules}\n\n` +
+          `Markdown:\n${content}`
+      }
+    ];
+    const raw = await this.requestChat(messages, true);
+    const plan = parseOrganizePlan(raw);
+    plan.path = normalizeMarkdownPath(plan.path);
+    if (!plan.content.trim()) throw new Error(`AI 沒有返回 ${file.path} 的整理內容。`);
+    return { ...plan, content: plan.content.trimEnd() + "\n" };
+  }
+
+  async confirmAndApplyOrganizePlans(items: Array<{ file: TFile; plan: OrganizePlan }>) {
+    if (!items.length) return;
+    if (this.settings.confirmBeforeApply) {
+      new ConfirmOrganizePlansModal(this.app, items, async () => {
+        await this.applyOrganizePlans(items);
+      }).open();
+      return;
+    }
+    await this.applyOrganizePlans(items);
+  }
+
+  async applyOrganizePlans(items: Array<{ file: TFile; plan: OrganizePlan }>) {
+    let applied = 0;
+    for (const item of items) {
+      const requestedPath = normalizeMarkdownPath(item.plan.path);
+      const targetPath = requestedPath === item.file.path ? requestedPath : this.getAvailableMarkdownPath(requestedPath);
+      await ensureFolder(this.app, targetPath);
+      let target = item.file;
+      if (item.file.path !== targetPath) {
+        await this.app.fileManager.renameFile(item.file, targetPath);
+        const renamed = this.app.vault.getAbstractFileByPath(targetPath);
+        if (!(renamed instanceof TFile)) throw new Error(`歸類後找不到文件：${targetPath}`);
+        target = renamed;
+      }
+      await this.app.vault.process(target, () => item.plan.content);
+      applied++;
+    }
+    new Notice(`已歸類/整理 ${applied} 份 Markdown。`);
   }
 
   async applyActions(actions: FileAction[]) {
@@ -1834,6 +2061,7 @@ class ModelPickerModal extends Modal {
     this.contentEl.createEl("h2", { text: uiText(this.plugin.settings, "selectModel") });
     const deepseek = this.plugin.settings.providers.deepseek;
     this.renderProviderModels("deepseek", undefined, "DeepSeek", deepseek, isEn);
+    this.renderProviderModels("ollama", undefined, "Ollama Local", this.plugin.settings.providers.ollama, isEn);
     for (const custom of this.plugin.getCustomProviders()) {
       this.renderProviderModels("custom", custom.id, custom.name || (isEn ? "Custom endpoint" : "自定義接口"), custom, isEn);
     }
@@ -1845,8 +2073,8 @@ class ModelPickerModal extends Modal {
     for (const model of this.plugin.getModelOptions(provider, customId)) {
       const row = section.createEl("button", { cls: "notecraft-ai-model-row" });
       row.createSpan({ text: model });
-      row.createSpan({ cls: "notecraft-ai-model-provider", text: config.apiKey ? (isEn ? "Ready" : "可用") : (isEn ? "Needs API key" : "需要 API Key") });
-      if (this.plugin.settings.provider === provider && (provider === "deepseek" || this.plugin.settings.activeCustomProviderId === customId) && config.model === model) row.addClass("is-active");
+      row.createSpan({ cls: "notecraft-ai-model-provider", text: provider === "ollama" || config.apiKey ? (isEn ? "Ready" : "可用") : (isEn ? "Needs API key" : "需要 API Key") });
+      if (this.plugin.settings.provider === provider && (provider !== "custom" || this.plugin.settings.activeCustomProviderId === customId) && config.model === model) row.addClass("is-active");
       row.onclick = async () => {
         this.plugin.settings.provider = provider;
         if (provider === "custom" && customId) this.plugin.settings.activeCustomProviderId = customId;
@@ -2421,9 +2649,49 @@ class ConfirmActionsModal extends Modal {
   }
 }
 
+class ConfirmOrganizePlansModal extends Modal {
+  items: Array<{ file: TFile; plan: OrganizePlan }>;
+  onConfirm: () => Promise<void>;
+
+  constructor(app: App, items: Array<{ file: TFile; plan: OrganizePlan }>, onConfirm: () => Promise<void>) {
+    super(app);
+    this.items = items;
+    this.onConfirm = onConfirm;
+  }
+
+  onOpen() {
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: "確認 AI 自動歸類" });
+    const preview = this.items
+      .map(({ file, plan }, index) =>
+        `${index + 1}. ${file.path} → ${plan.path}\n` +
+        `Confidence: ${plan.confidence ?? "unknown"}\n` +
+        `Reason: ${plan.reason ?? ""}\n\n` +
+        `${plan.content.slice(0, 700)}`
+      )
+      .join("\n\n---\n\n");
+    this.contentEl.createDiv({ cls: "notecraft-ai-preview", text: preview });
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText("取消").onClick(() => this.close()))
+      .addButton((button) =>
+        button
+          .setButtonText("套用歸類")
+          .setCta()
+          .onClick(async () => {
+            this.close();
+            try {
+              await this.onConfirm();
+            } catch (error) {
+              new Notice(String(error));
+            }
+          })
+      );
+  }
+}
+
 class NoteCraftAiSettingTab extends PluginSettingTab {
   plugin: NoteCraftAiPlugin;
-  activeTab: "basic" | "model" | "command" | "knowledge" | "advanced" = "basic";
+  activeTab: "basic" | "model" | "command" | "knowledge" | "organize" | "advanced" = "basic";
 
   constructor(app: App, plugin: NoteCraftAiPlugin) {
     super(app, plugin);
@@ -2440,6 +2708,7 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
     if (this.activeTab === "model") this.renderModel(containerEl);
     if (this.activeTab === "command") this.renderCommand(containerEl);
     if (this.activeTab === "knowledge") this.renderKnowledge(containerEl);
+    if (this.activeTab === "organize") this.renderOrganize(containerEl);
     if (this.activeTab === "advanced") this.renderAdvanced(containerEl);
   }
 
@@ -2451,6 +2720,7 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
       ["model", isEn ? "Model" : "模型"],
       ["command", isEn ? "Command" : "指令"],
       ["knowledge", isEn ? "Search" : "搜尋"],
+      ["organize", isEn ? "Organize" : "整理"],
       ["advanced", isEn ? "Advanced" : "進階"]
     ];
     for (const [id, label] of items) {
@@ -2467,10 +2737,11 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
     const isEn = this.plugin.settings.uiLanguage === "en";
     new Setting(containerEl)
       .setName(isEn ? "Model provider" : "模型提供者")
-      .setDesc(isEn ? "Choose DeepSeek or one of your saved OpenAI-compatible endpoints." : "選擇 DeepSeek 或你保存的其中一個 OpenAI-compatible 自定義接口。")
+      .setDesc(isEn ? "Choose DeepSeek, local Ollama, or one of your saved OpenAI-compatible endpoints." : "選擇 DeepSeek、本地 Ollama，或你保存的 OpenAI-compatible 自定義接口。")
       .addDropdown((dropdown) =>
         dropdown
           .addOption("deepseek", "DeepSeek")
+          .addOption("ollama", "Ollama Local")
           .addOption("custom", isEn ? "Custom endpoint" : "自定義接口")
           .setValue(this.plugin.settings.provider)
           .onChange(async (value) => {
@@ -2520,6 +2791,7 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
       });
 
     this.renderProviderDetails(containerEl, "deepseek", isEn ? "DeepSeek settings" : "DeepSeek 設定");
+    this.renderProviderDetails(containerEl, "ollama", isEn ? "Ollama local settings" : "Ollama 本地模型設定");
     for (const custom of this.plugin.getCustomProviders()) {
       this.renderProviderDetails(containerEl, "custom", custom.name || (isEn ? "Custom endpoint" : "自定義接口"), custom.id);
     }
@@ -2802,6 +3074,110 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
       );
   }
 
+  renderOrganize(containerEl: HTMLElement) {
+    const isEn = this.plugin.settings.uiLanguage === "en";
+    containerEl.createEl("h3", { text: isEn ? "Auto organize & Markdown format" : "自動歸類與 Markdown 標準化" });
+    containerEl.createEl("p", {
+      cls: "notecraft-ai-settings-note",
+      text: isEn
+        ? "These settings power the command palette actions: standardize current Markdown, organize current note, and organize Inbox."
+        : "這些設定會用於命令面板中的：一鍵標準化當前 Markdown、AI 自動歸類當前筆記、AI 自動歸類 Inbox。"
+    });
+
+    new Setting(containerEl)
+      .setName(isEn ? "Inbox folder" : "Inbox 資料夾")
+      .setDesc(isEn ? "Batch organize reads Markdown from this folder." : "批量歸類會讀取這個資料夾中的 Markdown。")
+      .addText((text) =>
+        text.setValue(this.plugin.settings.autoOrganizeInboxFolder).onChange(async (value) => {
+          this.plugin.settings.autoOrganizeInboxFolder = normalizePath(value.trim() || DEFAULT_SETTINGS.autoOrganizeInboxFolder);
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Default folder" : "不確定時放入")
+      .setDesc(isEn ? "The model uses this folder if the note is useful but ambiguous." : "內容有用但分類不明確時，模型會優先放到這裡。")
+      .addText((text) =>
+        text.setValue(this.plugin.settings.autoOrganizeDefaultFolder).onChange(async (value) => {
+          this.plugin.settings.autoOrganizeDefaultFolder = normalizePath(value.trim() || DEFAULT_SETTINGS.autoOrganizeDefaultFolder);
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Archive folder" : "歸檔資料夾")
+      .setDesc(isEn ? "Used for stale or no-longer-needed notes." : "過期或不再需要的內容會建議放到這裡。")
+      .addText((text) =>
+        text.setValue(this.plugin.settings.autoOrganizeArchiveFolder).onChange(async (value) => {
+          this.plugin.settings.autoOrganizeArchiveFolder = normalizePath(value.trim() || DEFAULT_SETTINGS.autoOrganizeArchiveFolder);
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Batch limit" : "批量上限")
+      .setDesc(isEn ? "Maximum notes processed by one Inbox organize run." : "每次 Inbox 自動歸類最多處理幾份筆記。")
+      .addText((text) =>
+        text.setValue(String(this.plugin.settings.autoOrganizeBatchLimit)).onChange(async (value) => {
+          this.plugin.settings.autoOrganizeBatchLimit = clampNumber(Number(value), 1, 50, DEFAULT_SETTINGS.autoOrganizeBatchLimit);
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Periodic Inbox organize" : "定期自動歸類 Inbox")
+      .setDesc(isEn ? "Runs while Obsidian is open. Keep confirmation enabled if you want to review changes." : "只會在 Obsidian 開啟時執行；如果想人工確認，請保持套用前確認開啟。")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.periodicAutoOrganizeEnabled).onChange(async (value) => {
+          this.plugin.settings.periodicAutoOrganizeEnabled = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Periodic interval hours" : "定期間隔小時")
+      .setDesc(isEn ? "168 means weekly." : "168 代表每週一次。")
+      .addText((text) =>
+        text.setValue(String(this.plugin.settings.autoOrganizeIntervalHours)).onChange(async (value) => {
+          this.plugin.settings.autoOrganizeIntervalHours = clampNumber(Number(value), 1, 24 * 30, DEFAULT_SETTINGS.autoOrganizeIntervalHours);
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Classification rules" : "歸類規則")
+      .setDesc(isEn ? "Describe your vault folders and how notes should be routed." : "描述你的庫資料夾，以及不同筆記應該如何路由。")
+      .addTextArea((text) =>
+        text.setValue(this.plugin.settings.autoOrganizeRules).onChange(async (value) => {
+          this.plugin.settings.autoOrganizeRules = value.trim() || DEFAULT_SETTINGS.autoOrganizeRules;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Markdown format rules" : "Markdown 標準化規則")
+      .setDesc(isEn ? "Used by both standardize and auto-organize commands." : "一鍵標準化與自動歸類都會使用這份規則。")
+      .addTextArea((text) =>
+        text.setValue(this.plugin.settings.markdownFormatRules).onChange(async (value) => {
+          this.plugin.settings.markdownFormatRules = value.trim() || DEFAULT_SETTINGS.markdownFormatRules;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName(isEn ? "Run now" : "立即執行")
+      .setDesc(isEn ? "Use the currently selected model. Keep confirmation enabled until you trust the rules." : "會使用當前模型。建議先保持「套用前確認」開啟。")
+      .addButton((button) =>
+        button.setButtonText(isEn ? "Standardize current note" : "標準化當前筆記").onClick(() => void this.plugin.standardizeCurrentMarkdown())
+      )
+      .addButton((button) =>
+        button.setButtonText(isEn ? "Organize current note" : "歸類當前筆記").onClick(() => void this.plugin.autoOrganizeCurrentNote())
+      )
+      .addButton((button) =>
+        button.setButtonText(isEn ? "Organize Inbox" : "歸類 Inbox").onClick(() => void this.plugin.autoOrganizeInbox())
+      );
+  }
+
   renderAdvanced(containerEl: HTMLElement) {
     const isEn = this.plugin.settings.uiLanguage === "en";
     containerEl.createEl("h3", { text: isEn ? "Advanced" : "進階" });
@@ -2954,7 +3330,7 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
   renderProviderDetails(containerEl: HTMLElement, provider: ProviderId, title: string, customId?: string) {
     const isEn = this.plugin.settings.uiLanguage === "en";
     const details = containerEl.createEl("details", { cls: "notecraft-ai-settings-group" });
-    details.open = provider === this.plugin.settings.provider && (provider === "deepseek" || customId === this.plugin.settings.activeCustomProviderId);
+    details.open = provider === this.plugin.settings.provider && (provider !== "custom" || customId === this.plugin.settings.activeCustomProviderId);
     details.createEl("summary", { text: title });
     const config = this.plugin.getProviderConfig(provider, customId);
     const customConfig = provider === "custom" ? this.plugin.getCustomProviderConfig(customId) : null;
@@ -3007,10 +3383,10 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
 
     new Setting(details)
       .setName("API Key")
-      .setDesc(provider === "deepseek" ? "DeepSeek API Key." : (isEn ? "API key for the custom endpoint." : "自定義接口的 API Key。"))
+      .setDesc(provider === "deepseek" ? "DeepSeek API Key." : provider === "ollama" ? (isEn ? "Not required for local Ollama. Leave empty." : "本地 Ollama 不需要 API Key，可留空。") : (isEn ? "API key for the custom endpoint." : "自定義接口的 API Key。"))
       .addText((text) =>
         text
-          .setPlaceholder("sk-...")
+          .setPlaceholder(provider === "ollama" ? "" : "sk-...")
           .setValue(config.apiKey)
           .onChange(async (value) => {
             config.apiKey = value.trim();
@@ -3020,10 +3396,10 @@ class NoteCraftAiSettingTab extends PluginSettingTab {
 
     new Setting(details)
       .setName("Base URL")
-      .setDesc(provider === "deepseek" ? "DeepSeek official URL: https://api.deepseek.com" : (isEn ? "OpenAI-compatible API base URL for this endpoint, usually ending in /v1." : "此接口的 OpenAI-compatible API Base URL，通常以 /v1 結尾。"))
+      .setDesc(provider === "deepseek" ? "DeepSeek official URL: https://api.deepseek.com" : provider === "ollama" ? "Ollama OpenAI-compatible URL, usually http://localhost:11434/v1." : (isEn ? "OpenAI-compatible API base URL for this endpoint, usually ending in /v1." : "此接口的 OpenAI-compatible API Base URL，通常以 /v1 結尾。"))
       .addText((text) =>
         text
-          .setPlaceholder(provider === "deepseek" ? "https://api.deepseek.com" : "https://provider.example/v1")
+          .setPlaceholder(provider === "deepseek" ? "https://api.deepseek.com" : provider === "ollama" ? "http://localhost:11434/v1" : "https://provider.example/v1")
           .setValue(config.baseUrl)
           .onChange(async (value) => {
             config.baseUrl = normalizeProviderBaseUrl(value.trim());
@@ -3207,10 +3583,23 @@ function normalizeSettings(raw: unknown): Settings {
         ...DEFAULT_SETTINGS.providers.deepseek,
         ...(saved.providers?.deepseek ?? {})
       },
+      ollama: {
+        ...DEFAULT_SETTINGS.providers.ollama,
+        ...(saved.providers?.ollama ?? {})
+      },
       custom: stripCustomProvider(customProviders[0])
     },
     customProviders,
-    activeCustomProviderId: customProviders.some((provider) => provider.id === saved.activeCustomProviderId) ? String(saved.activeCustomProviderId) : customProviders[0].id
+    activeCustomProviderId: customProviders.some((provider) => provider.id === saved.activeCustomProviderId) ? String(saved.activeCustomProviderId) : customProviders[0].id,
+    autoOrganizeInboxFolder: typeof saved.autoOrganizeInboxFolder === "string" && saved.autoOrganizeInboxFolder.trim() ? normalizePath(saved.autoOrganizeInboxFolder) : DEFAULT_SETTINGS.autoOrganizeInboxFolder,
+    autoOrganizeDefaultFolder: typeof saved.autoOrganizeDefaultFolder === "string" && saved.autoOrganizeDefaultFolder.trim() ? normalizePath(saved.autoOrganizeDefaultFolder) : DEFAULT_SETTINGS.autoOrganizeDefaultFolder,
+    autoOrganizeArchiveFolder: typeof saved.autoOrganizeArchiveFolder === "string" && saved.autoOrganizeArchiveFolder.trim() ? normalizePath(saved.autoOrganizeArchiveFolder) : DEFAULT_SETTINGS.autoOrganizeArchiveFolder,
+    autoOrganizeBatchLimit: clampNumber(saved.autoOrganizeBatchLimit ?? DEFAULT_SETTINGS.autoOrganizeBatchLimit, 1, 50, DEFAULT_SETTINGS.autoOrganizeBatchLimit),
+    periodicAutoOrganizeEnabled: saved.periodicAutoOrganizeEnabled ?? DEFAULT_SETTINGS.periodicAutoOrganizeEnabled,
+    autoOrganizeIntervalHours: clampNumber(saved.autoOrganizeIntervalHours ?? DEFAULT_SETTINGS.autoOrganizeIntervalHours, 1, 24 * 30, DEFAULT_SETTINGS.autoOrganizeIntervalHours),
+    lastAutoOrganizeAt: typeof saved.lastAutoOrganizeAt === "number" ? saved.lastAutoOrganizeAt : DEFAULT_SETTINGS.lastAutoOrganizeAt,
+    autoOrganizeRules: typeof saved.autoOrganizeRules === "string" && saved.autoOrganizeRules.trim() ? saved.autoOrganizeRules : DEFAULT_SETTINGS.autoOrganizeRules,
+    markdownFormatRules: typeof saved.markdownFormatRules === "string" && saved.markdownFormatRules.trim() ? saved.markdownFormatRules : DEFAULT_SETTINGS.markdownFormatRules
   };
 
   if (saved.apiKey || saved.baseUrl || saved.model) {
@@ -3222,11 +3611,12 @@ function normalizeSettings(raw: unknown): Settings {
     };
   }
 
-  if (settings.provider !== "deepseek" && settings.provider !== "custom") {
+  if (settings.provider !== "deepseek" && settings.provider !== "ollama" && settings.provider !== "custom") {
     settings.provider = "deepseek";
   }
 
   normalizeProviderConfig(settings.providers.deepseek, DEFAULT_SETTINGS.providers.deepseek);
+  normalizeProviderConfig(settings.providers.ollama, DEFAULT_SETTINGS.providers.ollama);
   for (const config of settings.customProviders) normalizeProviderConfig(config, DEFAULT_SETTINGS.providers.custom);
   const activeCustom = settings.customProviders.find((provider) => provider.id === settings.activeCustomProviderId) ?? settings.customProviders[0];
   settings.activeCustomProviderId = activeCustom.id;
@@ -3360,7 +3750,16 @@ function createSettingsProfile(settings: Settings): Partial<Settings> {
     knowledgeTopK: settings.knowledgeTopK,
     uiLanguage: settings.uiLanguage,
     uiFontFamily: settings.uiFontFamily,
-    settingsProfilePath: settings.settingsProfilePath
+    settingsProfilePath: settings.settingsProfilePath,
+    autoOrganizeInboxFolder: settings.autoOrganizeInboxFolder,
+    autoOrganizeDefaultFolder: settings.autoOrganizeDefaultFolder,
+    autoOrganizeArchiveFolder: settings.autoOrganizeArchiveFolder,
+    autoOrganizeBatchLimit: settings.autoOrganizeBatchLimit,
+    periodicAutoOrganizeEnabled: settings.periodicAutoOrganizeEnabled,
+    autoOrganizeIntervalHours: settings.autoOrganizeIntervalHours,
+    lastAutoOrganizeAt: settings.lastAutoOrganizeAt,
+    autoOrganizeRules: settings.autoOrganizeRules,
+    markdownFormatRules: settings.markdownFormatRules
   };
 }
 
@@ -3806,7 +4205,14 @@ function execFileText(file: string, args: string[], timeout: number): Promise<st
 function stripJsonFence(raw: string): string {
   const trimmed = raw.trim();
   const fenced = trimmed.match(/```(?:json|file-action)?\s*([\s\S]*?)```/i);
-  return (fenced?.[1] ?? trimmed).trim();
+  const candidate = (fenced?.[1] ?? trimmed)
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .trim();
+  if (candidate.startsWith("{")) return candidate;
+  const first = candidate.indexOf("{");
+  const last = candidate.lastIndexOf("}");
+  if (first !== -1 && last > first) return candidate.slice(first, last + 1).trim();
+  return candidate;
 }
 
 function normalizeProviderBaseUrl(baseUrl: string): string {
@@ -3998,6 +4404,25 @@ function parseActions(raw: string): FileAction[] {
     }
   }
   return actions.filter((action) => action.action && typeof action.content === "string");
+}
+
+function parseOrganizePlan(raw: string): OrganizePlan {
+  const parsed = JSON.parse(stripJsonFence(raw)) as Partial<OrganizePlan>;
+  if (typeof parsed.path !== "string" || !parsed.path.trim()) {
+    throw new Error("AI 歸類結果缺少 path。");
+  }
+  if (typeof parsed.content !== "string" || !parsed.content.trim()) {
+    throw new Error("AI 歸類結果缺少 content。");
+  }
+  const confidence = parsed.confidence === "high" || parsed.confidence === "medium" || parsed.confidence === "low"
+    ? parsed.confidence
+    : undefined;
+  return {
+    path: parsed.path,
+    content: parsed.content,
+    reason: typeof parsed.reason === "string" ? parsed.reason : "",
+    confidence
+  };
 }
 
 function extractActionJsonBlocks(raw: string): string[] {

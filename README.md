@@ -22,7 +22,53 @@ Plugin id: `notecraft-ai`
 - Configurable interface font.
 - Conversation memory file.
 - Markdown-based settings profile import/export.
+- AI auto-organize commands for the current note or Inbox folder.
+- One-click Markdown standardization for frontmatter, headings, tasks, and note structure.
+- Optional periodic Inbox organization while Obsidian is open.
+- Local Ollama provider entry for DeepSeek-family models via Ollama's OpenAI-compatible endpoint.
 - Mobile-compatible core workflow. Obsidian CLI helpers are desktop-only.
+
+## Auto Organize and Markdown Standardization
+
+The plugin adds these Obsidian commands:
+
+- `NoteCraft AI: 一鍵標準化當前 Markdown`
+- `NoteCraft AI: AI 自動歸類當前筆記`
+- `NoteCraft AI: AI 自動歸類 Inbox`
+
+Open `Settings → NoteCraft AI → 整理` to configure:
+
+- Inbox folder
+- default folder for uncertain notes
+- archive folder
+- batch limit
+- periodic organize interval
+- classification rules
+- Markdown formatting rules
+
+Auto-organize asks the active model to return a target path, standardized full Markdown content, reason, and confidence. If `Confirm before applying file actions` is enabled, the plugin shows a review modal before renaming or rewriting notes.
+
+## Local Ollama / DeepSeek
+
+To use a local DeepSeek model through Ollama:
+
+1. Install and start Ollama.
+2. Pull a DeepSeek-family model, for example:
+
+```bash
+ollama pull deepseek-r1:8b
+```
+
+3. In `Settings → NoteCraft AI → 模型`, choose `Ollama Local`.
+4. Keep the default Base URL:
+
+```text
+http://localhost:11434/v1
+```
+
+5. Choose a DeepSeek model name that exists in your Ollama installation.
+
+Ollama does not require an API key. The local provider currently uses the OpenAI-compatible chat completions API.
 
 ## BRAT Installation
 
