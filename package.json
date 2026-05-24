@@ -1,6 +1,6 @@
 {
   "name": "notecraft-ai",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Obsidian plugin for AI-assisted Markdown editing.",
   "main": "main.js",
   "scripts": {
